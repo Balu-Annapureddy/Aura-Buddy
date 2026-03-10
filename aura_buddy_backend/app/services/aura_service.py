@@ -29,6 +29,49 @@ class AuraService:
         if not receiver:
             raise HTTPException(status_code=404, detail="Post author not found")
 
+        # 1. Prevent multiple tips to the same post
+        existing_transfer = (
+            db.query(AuraTransaction)
+            .filter(
+                AuraTransaction.from_user_id == giver.id,
+                AuraTransaction.post_id == post_id,
+                AuraTransaction.transaction_type == TransactionType.TRANSFER
+            )
+            .first()
+        )
+        if existing_transfer:
+            raise HTTPException(status_code=400, detail="You have already given Aura to this post")
+
+        # 2. Daily giving limit check
+        one_day_ago = datetime.now(timezone.utc) - timedelta(days=1)
+        recent_given = (
+            db.query(sql_func.sum(AuraTransaction.amount))
+            .filter(
+                AuraTransaction.from_user_id == giver.id,
+                AuraTransaction.transaction_type == TransactionType.TRANSFER,
+                AuraTransaction.created_at >= one_day_ago
+            )
+            .scalar() or 0
+        )
+        if recent_given + amount > settings.DAILY_AURA_GIVE_LIMIT:
+            raise HTTPException(
+                status_code=429, 
+                detail=f"Daily Aura limit reached. Max {settings.DAILY_AURA_GIVE_LIMIT} per 24 hours."
+            )
+
+        # 3. Suspicious transfer check: > 100 Aura to same receiver within 24h
+        recent_to_receiver = (
+            db.query(sql_func.sum(AuraTransaction.amount))
+            .filter(
+                AuraTransaction.from_user_id == giver.id,
+                AuraTransaction.to_user_id == receiver.id,
+                AuraTransaction.transaction_type == TransactionType.TRANSFER,
+                AuraTransaction.created_at >= one_day_ago
+            )
+            .scalar() or 0
+        )
+        is_suspicious = (recent_to_receiver + amount) > 100
+
         # Atomic balance update
         giver.aura_balance -= amount
         receiver.aura_balance += amount
@@ -40,8 +83,12 @@ class AuraService:
             post_id=post_id,
             amount=amount,
             transaction_type=TransactionType.TRANSFER,
+            is_suspicious=is_suspicious
         )
         db.add(transaction)
+        
+        # Log reciprocal transaction type for metrics (optional, keeping basic for now)
+        
         db.commit()
         db.refresh(transaction)
         return transaction
@@ -147,9 +194,26 @@ class AuraService:
     def grant_mission_reward(db: Session, user: User, auto_commit: bool = True) -> AuraTransaction:
         """
         Grant mission completion Aura reward.
+        Enforces a 24-hour cooldown.
         When called from jury_service (auto_commit=False), the caller handles commit
         to keep the entire vote + reward operation atomic.
         """
+        window_start = datetime.now(timezone.utc) - timedelta(hours=settings.MISSION_REWARD_COOLDOWN_HOURS)
+        recent_reward = (
+            db.query(AuraTransaction)
+            .filter(
+                AuraTransaction.to_user_id == user.id,
+                AuraTransaction.transaction_type == TransactionType.MISSION_REWARD,
+                AuraTransaction.created_at >= window_start
+            )
+            .first()
+        )
+        if recent_reward:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Mission reward cooldown active. Try again in {settings.MISSION_REWARD_COOLDOWN_HOURS} hours."
+            )
+
         user.aura_balance += settings.MISSION_REWARD_AMOUNT
 
         transaction = AuraTransaction(
@@ -161,4 +225,38 @@ class AuraService:
         if auto_commit:
             db.commit()
             db.refresh(transaction)
+        return transaction
+        
+    @staticmethod
+    def grant_mood_reward(db: Session, user: User) -> AuraTransaction:
+        """
+        Grant daily mood log Aura reward.
+        Enforces a 12-hour cooldown.
+        """
+        window_start = datetime.now(timezone.utc) - timedelta(hours=settings.MOOD_REWARD_COOLDOWN_HOURS)
+        recent_reward = (
+            db.query(AuraTransaction)
+            .filter(
+                AuraTransaction.to_user_id == user.id,
+                AuraTransaction.transaction_type == TransactionType.MOOD_REWARD,
+                AuraTransaction.created_at >= window_start
+            )
+            .first()
+        )
+        if recent_reward:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Mood reward cooldown active. Try again in {settings.MOOD_REWARD_COOLDOWN_HOURS} hours."
+            )
+
+        user.aura_balance += settings.MOOD_REWARD_AMOUNT
+
+        transaction = AuraTransaction(
+            to_user_id=user.id,
+            amount=settings.MOOD_REWARD_AMOUNT,
+            transaction_type=TransactionType.MOOD_REWARD,
+        )
+        db.add(transaction)
+        db.commit()
+        db.refresh(transaction)
         return transaction

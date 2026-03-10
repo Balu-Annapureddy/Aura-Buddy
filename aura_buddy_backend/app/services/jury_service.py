@@ -1,4 +1,6 @@
+from datetime import datetime, timedelta, timezone
 from sqlalchemy.orm import Session
+from sqlalchemy import func as sql_func
 from fastapi import HTTPException
 
 from app.models.mission import Mission, MissionStatus
@@ -27,7 +29,35 @@ class JuryService:
         if mission.user_id == user.id:
             raise HTTPException(status_code=400, detail="Cannot vote on your own mission")
 
-        # Check if user already voted (also enforced by DB unique constraint)
+        # 1. Check account age
+        account_age = datetime.now(timezone.utc) - user.created_at
+        if account_age < timedelta(hours=settings.JURY_MIN_ACCOUNT_AGE_HOURS):
+            raise HTTPException(
+                status_code=403, 
+                detail=f"Account must be at least {settings.JURY_MIN_ACCOUNT_AGE_HOURS} hours old to participate in the Jury"
+            )
+
+        # 2. Check aura balance
+        if user.aura_balance < settings.JURY_MIN_AURA_BALANCE:
+            raise HTTPException(
+                status_code=403, 
+                detail=f"You need at least {settings.JURY_MIN_AURA_BALANCE} Aura to participate in the Jury"
+            )
+
+        # 3. Check voting cooldown (daily limit)
+        one_day_ago = datetime.now(timezone.utc) - timedelta(days=1)
+        recent_votes = (
+            db.query(sql_func.count(Vote.id))
+            .filter(Vote.user_id == user.id, Vote.created_at >= one_day_ago)
+            .scalar() or 0
+        )
+        if recent_votes >= settings.JURY_DAILY_VOTE_LIMIT:
+            raise HTTPException(
+                status_code=429, 
+                detail=f"Daily jury vote limit reached. Max {settings.JURY_DAILY_VOTE_LIMIT} per 24 hours."
+            )
+
+        # 4. Check if user already voted (also enforced by DB unique constraint)
         existing_vote = (
             db.query(Vote)
             .filter(Vote.user_id == user.id, Vote.mission_id == mission_id)
@@ -51,15 +81,20 @@ class JuryService:
         else:
             mission.votes_cap += 1
 
-        # Check thresholds
-        if mission.votes_valid >= settings.MISSION_APPROVAL_THRESHOLD:
-            mission.status = MissionStatus.APPROVED
-            # Award mission Aura to the submitter
-            mission_owner = db.query(User).filter(User.id == mission.user_id).first()
-            if mission_owner:
-                AuraService.grant_mission_reward(db, mission_owner, auto_commit=False)
-        elif mission.votes_cap >= settings.MISSION_REJECTION_THRESHOLD:
-            mission.status = MissionStatus.REJECTED
+        # Strict Thresholds: Required total votes AND majority percentage
+        total_votes = mission.votes_valid + mission.votes_cap
+        
+        if total_votes >= settings.MISSION_APPROVAL_THRESHOLD:
+            valid_ratio = mission.votes_valid / total_votes
+            if valid_ratio >= 0.70:
+                mission.status = MissionStatus.APPROVED
+                # Award mission Aura to the submitter
+                mission_owner = db.query(User).filter(User.id == mission.user_id).first()
+                if mission_owner:
+                    AuraService.grant_mission_reward(db, mission_owner, auto_commit=False)
+            elif valid_ratio < 0.30 or mission.votes_cap >= settings.MISSION_REJECTION_THRESHOLD:
+                # If definitely failed, or hit absolute rejection threshold
+                mission.status = MissionStatus.REJECTED
 
         db.commit()
         db.refresh(vote)

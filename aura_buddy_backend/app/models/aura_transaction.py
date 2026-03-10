@@ -6,11 +6,15 @@ from app.database import Base
 
 class TransactionType(str, enum.Enum):
     TRANSFER = "TRANSFER"
+    POST_REWARD = "POST_REWARD"
+    AURA_GIVEN = "AURA_GIVEN"
+    AURA_TAKEN = "AURA_TAKEN"
     HATER_TAX = "HATER_TAX"
     AD_REWARD = "AD_REWARD"
     PREMIUM_BONUS = "PREMIUM_BONUS"
     MISSION_REWARD = "MISSION_REWARD"
-
+    MOOD_REWARD = "MOOD_REWARD"
+    JURY_REWARD = "JURY_REWARD"
 
 class AuraTransaction(Base):
     __tablename__ = "aura_transactions"
@@ -21,6 +25,7 @@ class AuraTransaction(Base):
     post_id = Column(Integer, ForeignKey("posts.id"), nullable=True, index=True)
     amount = Column(Integer, nullable=False)
     transaction_type = Column(Enum(TransactionType, native_enum=False), nullable=False)
+    is_suspicious = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     # Relationships
